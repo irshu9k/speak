@@ -1,0 +1,7 @@
+uploads/
+outputs/
+*.pyc
+__pycache__/
+*.wav
+*.mp3
+temp_service_account.json
