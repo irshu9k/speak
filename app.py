@@ -1,91 +1,70 @@
-from flask import Flask, request, jsonify
+from fastapi import FastAPI
+from pydantic import BaseModel
+import uvicorn
 import os
-from werkzeug.utils import secure_filename
-from pydub import AudioSegment
-import uuid
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
-import subprocess
+import tempfile
 import base64
+from datetime import datetime
 
-UPLOAD_FOLDER = "uploads"
-OUTPUT_FOLDER = "outputs"
+import numpy as np
+import scipy.io.wavfile as wavfile
+from pydrive.auth import GoogleAuth
+from pydrive.drive import GoogleDrive
 
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+from bark import SAMPLE_RATE, generate_text_semantic, semantic_to_waveform
+from bark.voice import clone_voice
 
-app = Flask(__name__)
-app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
-app.config['OUTPUT_FOLDER'] = OUTPUT_FOLDER
+app = FastAPI()
 
-# ================================
-# Google Drive Auth using base64
-# ================================
-encoded_creds = os.environ.get("GOOGLE_SERVICE_ACCOUNT_BASE64")
+# ==== STEP 1: Decode service account JSON ====
+gdrive_b64 = os.getenv("GDRIVE_CRED_B64")
+if not gdrive_b64:
+    raise RuntimeError("Missing GDRIVE_CRED_B64 environment variable.")
 
-if not encoded_creds:
-    raise RuntimeError("Missing GOOGLE_SERVICE_ACCOUNT_BASE64 environment variable")
+cred_path = os.path.join(tempfile.gettempdir(), "service-account.json")
+with open(cred_path, "wb") as f:
+    f.write(base64.b64decode(gdrive_b64))
 
-decoded_json_path = "temp_service_account.json"
-with open(decoded_json_path, "wb") as f:
-    f.write(base64.b64decode(encoded_creds))
+# ==== STEP 2: Google Drive Auth ====
+gauth = GoogleAuth()
+gauth.LoadCredentialsFile(cred_path)
+if gauth.credentials is None:
+    gauth.LocalWebserverAuth()
+else:
+    gauth.Authorize()
+drive = GoogleDrive(gauth)
 
-SCOPES = ['https://www.googleapis.com/auth/drive']
-credentials = service_account.Credentials.from_service_account_file(
-    decoded_json_path, scopes=SCOPES)
-drive_service = build('drive', 'v3', credentials=credentials)
+# ==== STEP 3: Voice Cloning Setup ====
+VOICE_SAMPLE_PATH = "3voice.wav"
+CLONED_SPEAKER = clone_voice(VOICE_SAMPLE_PATH)
 
-# Bark CLI command template
-BARK_CMD = "python bark-clone/cli.py --text \"{text}\" --custom-voice {voice} --output {output}"
+class RequestBody(BaseModel):
+    text: str
 
-@app.route('/clone', methods=['POST'])
-def clone_voice():
-    if 'text' not in request.form:
-        return jsonify({'error': 'Missing text'}), 400
-    text = request.form['text']
+@app.post("/speak")
+async def speak(req: RequestBody):
+    text = req.text
+    print("Received text:", text)
 
-    if 'audio' not in request.files:
-        return jsonify({'error': 'Audio sample required'}), 400
+    semantic_tokens = generate_text_semantic(text, history_prompt=CLONED_SPEAKER)
+    audio_array = semantic_to_waveform(semantic_tokens, history_prompt=CLONED_SPEAKER)
 
-    audio = request.files['audio']
-    filename = secure_filename(audio.filename)
-    filepath = os.path.join(UPLOAD_FOLDER, filename)
-    audio.save(filepath)
+    tmp_audio_path = os.path.join(tempfile.gettempdir(), "final_speech.wav")
+    wavfile.write(tmp_audio_path, SAMPLE_RATE, audio_array)
 
-    # Convert to .wav if not already
-    if not filepath.endswith('.wav'):
-        sound = AudioSegment.from_file(filepath)
-        filepath = filepath.rsplit('.', 1)[0] + '.wav'
-        sound.export(filepath, format='wav')
+    upload_name = f"final_speech_{datetime.now().strftime('%Y%m%d_%H%M%S')}.wav"
+    file_drive = drive.CreateFile({'title': upload_name})
+    file_drive.SetContentFile(tmp_audio_path)
+    file_drive.Upload()
+    file_drive.InsertPermission({
+        'type': 'anyone',
+        'value': 'anyone',
+        'role': 'reader'
+    })
 
-    # Copy audio to Bark custom voice folder
-    voice_id = str(uuid.uuid4())
-    custom_voice_path = f"bark-clone/custom_voice/{voice_id}.wav"
-    os.makedirs("bark-clone/custom_voice", exist_ok=True)
-    os.rename(filepath, custom_voice_path)
+    return {
+        "drive_link": f"https://drive.google.com/uc?id={file_drive['id']}&export=download"
+    }
 
-    output_path = f"{OUTPUT_FOLDER}/{voice_id}_output.wav"
-    cmd = BARK_CMD.format(text=text, voice=voice_id, output=output_path)
-
-    result = subprocess.run(cmd, shell=True)
-    if result.returncode != 0:
-        return jsonify({"error": "Voice cloning failed"}), 500
-
-    # Convert to mp3
-    mp3_path = output_path.replace(".wav", ".mp3")
-    AudioSegment.from_wav(output_path).export(mp3_path, format="mp3")
-
-    # Upload to Google Drive
-    file_metadata = {'name': 'final_speech.mp3', 'mimeType': 'audio/mpeg'}
-    media = MediaFileUpload(mp3_path, mimetype='audio/mpeg')
-    file = drive_service.files().create(body=file_metadata, media_body=media, fields='id').execute()
-
-    file_id = file.get('id')
-    drive_service.permissions().create(fileId=file_id, body={'type': 'anyone', 'role': 'reader'}).execute()
-    url = f"https://drive.google.com/uc?id={file_id}&export=download"
-
-    return jsonify({'success': True, 'url': url})
-
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)
