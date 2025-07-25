@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+pydantic
+pydrive
+bark
+scipy
+torch
+numpy
