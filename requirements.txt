@@ -1,8 +1,6 @@
-fastapi
-uvicorn
-pydantic
-pydrive
-bark
-scipy
-torch
-numpy
+Flask
+pydub
+google-api-python-client
+google-auth
+google-auth-httplib2
+google-auth-oauthlib
